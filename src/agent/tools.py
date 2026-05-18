@@ -175,6 +175,7 @@ class AgentTools:
         client: Any,
         model: str,
         candidate_sample_frames: int,
+        candidate_video_height: int = 480,
         prompts: dict[str, str],
         logger,
         coarse_frames: int = 16,
@@ -184,6 +185,7 @@ class AgentTools:
         self.client = client
         self.model = model
         self.candidate_sample_frames = candidate_sample_frames
+        self.candidate_video_height = max(1, int(candidate_video_height))
         self.prompts = prompts
         self.log = logger
         self.coarse_frames = coarse_frames
@@ -617,9 +619,10 @@ class AgentTools:
         out_template = str(Path(output_dir) / "%(id)s.%(ext)s")
 
         # Single-file mp4 first to avoid merge dependency; merged formats as fallback.
+        max_height = self.candidate_video_height
         format_selector = (
-            "best[ext=mp4][height<=720]/best[ext=mp4]/"
-            "bv*[height<=720]+ba/best[height<=720]/best"
+            f"best[ext=mp4][height<={max_height}]/best[ext=mp4]/"
+            f"bv*[height<={max_height}]+ba/best[height<={max_height}]/best"
         )
 
         def _build_cmd(use_browser_cookies: bool) -> list[str]:
@@ -1061,6 +1064,8 @@ class AgentTools:
         source_descriptions: list[str],
         prev_queries: list[str],
         *,
+        current_round: int | None = None,
+        max_rounds: int | None = None,
         physical_observations: str = "",
         logical_analysis: str = "",
         search_intent: str = "",
@@ -1095,8 +1100,28 @@ class AgentTools:
         # Format previous queries
         q_str = "\n".join(f"  - {q}" for q in prev_queries) if prev_queries else "  (none)"
         entities_summary = json.dumps(entities or {}, ensure_ascii=False)
+        if current_round is not None and max_rounds is not None:
+            if current_round == max_rounds - 1:
+                round_status = (
+                    f"Current round: {current_round}/{max_rounds}. "
+                    f"The NEXT round ({max_rounds}/{max_rounds}) will be the FINAL round. "
+                    "If evidence is still insufficient, you must output one concrete non-empty next_keyword for that final attempt."
+                )
+            elif current_round >= max_rounds:
+                round_status = (
+                    f"Current round: {current_round}/{max_rounds}. "
+                    "This is already the FINAL round."
+                )
+            else:
+                round_status = (
+                    f"Current round: {current_round}/{max_rounds}. "
+                    f"There are {max_rounds - current_round} round(s) remaining including the next one."
+                )
+        else:
+            round_status = "Round status unavailable."
 
         prompt = PROMPT_DEEPSEARCH_NEXT_STEP.format(
+            round_status=round_status,
             physical_observations=physical_observations or "(not available)",
             logical_analysis=logical_analysis or "(not available)",
             search_intent=search_intent or "(not available)",

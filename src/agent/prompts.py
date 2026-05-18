@@ -301,6 +301,9 @@ PROMPT_DEEPSEARCH_NEXT_STEP = """You are the decision-maker in a deep-search loo
 
 CONTEXT (do NOT echo back):
 
+- Round status:
+{round_status}
+
 — What the video looks like (from COT analysis of the input video):
 - Physical observations: {physical_observations}
 - Logical analysis: {logical_analysis}
@@ -334,6 +337,7 @@ CRITICAL RULES:
 - If the current evidence mainly highlights that Group A and Group B are from different eras, different shows, different productions, or different contexts, that is evidence of topical relatedness, NOT sufficient source resolution. Keep searching.
 - For MULTI-SOURCE or MULTI-SCENE cases: you need evidence that covers EACH major source family or unresolved scene cluster.
 - Prefer precision over early stopping. It is acceptable to continue searching when the current best evidence is only "related but not same-source enough."
+- If the round status says the NEXT round will be the FINAL round and the evidence is still insufficient, you MUST output one concrete, non-empty, immediately usable `next_keyword`. Do not leave `next_keyword` empty in that case.
 
 TASK 2 — NEXT KEYWORD (only if NOT sufficient): Generate the SINGLE best YouTube search query to find the next missing original source.
 
@@ -342,6 +346,7 @@ THINK STEP BY STEP for keyword generation:
 2. What specific distinguishing cue would most likely retrieve useful evidence for it?
 3. Generate ONE search query (5-12 words) using the strongest identifying anchor available.
 4. Prefer a query that could plausibly match a real YouTube title or high-value search phrase.
+5. If the NEXT round will be the FINAL round, optimize for the highest-value decisive query rather than a conservative one.
 
 OUTPUT JSON FORMAT:
 {{
@@ -356,27 +361,26 @@ OUTPUT JSON FORMAT:
 # Stage B - forgery analysis (NEW)
 # ============================================================
 
-# The forgery-analysis prompts demand 3-5 points in the GT phrasing
-# pattern:  "虚假视频通过 <剪辑手法> 的剪辑手法，将 <原本> 重构为 <伪造>；
-#            其误导点在于 <misleading_point>。"
-# Output is bilingual (Chinese + English) so the paper can quote either.
+# The judge compares 3-5 GT points against 3-5 predicted points and scores
+# whether each GT point is matched by a prediction, primarily on the
+# misleading-point dimension.
 
 # ============================================================
 # Stage C - LLM-as-judge (NEW)
 # ============================================================
 
-PROMPT_JUDGE_POINTS = """你是一个严格但公允的视频伪造分析评分员。给定一个伪造视频的「标准答案 (GT)」3 点伪造描述与模型给出的 3 点预测，需要逐点判断预测是否命中了 GT 中的某一点。
+PROMPT_JUDGE_POINTS = """You are a strict but fair evaluator for video forgery analysis. You will be given a ground-truth (GT) list of 3-5 forgery points and a predicted list of 3-5 forgery points. For each GT point, decide whether any prediction matches it.
 
-评分规则（极其重要，请严格执行）：
-1. 每一条 GT 最多被命中一次（一对一最优指派）。
-2. 一条预测命中 GT 的判定标准 = 维度 B（误导点）「大致一致」即可：
-   - 维度 B：误导点 / 重构后的虚假叙事。
-   - 维度 A（剪辑手法）仅供参考，不要求与 GT 一致，但仍须如实填写 matched_dim_method。
-   维度 B 大致一致 → 命中 (verdict=1)。
-   维度 B 不一致 → 不命中 (verdict=0)。但仍须输出最相近的 GT 索引及理由。
-3. 「大致一致」允许同义改写、措辞差异、抽象层级不同。
-4. 你必须为每一条 GT 给出一个最优配对的预测；如果同一条预测被多条 GT 抢占，按你的最佳总分指派（避免出现两条 GT 都映射到同一个 pred 而总分被低估）。
-5. 输出严格 JSON，禁止 markdown 围栏。
+Scoring rules (important; follow strictly):
+1. Each GT point can be matched at most once. Use a one-to-one best assignment.
+2. A prediction counts as a match if Dimension B, the misleading point / false reframing, is roughly consistent with the GT point.
+   - Dimension B: the misleading point or false narrative created by the edit.
+   - Dimension A: the manipulation method. This is secondary and does not need to match for `verdict=1`, but you must still report `matched_dim_method` truthfully.
+   - If Dimension B is roughly consistent, mark `verdict=1`.
+   - If Dimension B is not consistent, mark `verdict=0`, but still provide the closest GT index and explain why.
+3. "Roughly consistent" allows paraphrase, synonymy, wording differences, and different abstraction levels.
+4. Every GT point should receive the best available predicted match. If multiple GT points compete for the same prediction, choose the assignment that gives the best overall scoring.
+5. Output strict JSON only. Do not use markdown fences.
 
 GT (3-5 points):
 {gt_block}
@@ -384,19 +388,19 @@ GT (3-5 points):
 PREDICTION (3-5 points):
 {pred_block}
 
-请输出：
+Output JSON:
 {{
-  "hits": <0|1|2|3>,
-  "score": <hits/3 浮点>,
+  "hits": <integer from 0 to number_of_gt_points>,
+  "score": <hits / number_of_gt_points as a float>,
   "matches": [
     {{
-      "gt_idx": <0|1|2>,
-      "pred_idx": <0|1|2|null when 不匹配>,
+      "gt_idx": <0-based GT index>,
+      "pred_idx": <0-based prediction index or null if no match>,
       "verdict": <0|1>,
       "matched_dim_method": <true|false>,
       "matched_dim_misleading": <true|false>,
-      "reason": "一句话中文理由：手法是否一致 / 误导点是否一致 / 哪里不一致"
+      "reason": "One concise English sentence explaining whether the method matches, whether the misleading point matches, and the key mismatch if any."
     }}
   ],
-  "comment": "整体评价 1-2 句中文，指出预测的最大优点 / 最大缺陷。"
+  "comment": "1-2 concise English sentences summarizing the biggest strength and biggest weakness of the predictions."
 }}"""

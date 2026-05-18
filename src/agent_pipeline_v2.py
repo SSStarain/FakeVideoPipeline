@@ -61,7 +61,8 @@ class VisualRetrievalAgentV2:
         *,
         top_k: int = 10,
         total_sample_frames: int = 64,
-        candidate_sample_frames: int = 64,
+        candidate_sample_frames: int | None = None,
+        candidate_video_height: int = 480,
         max_reflect_rounds: int = 3,
         download_output_dir: str = "downloads",
         oracle_manifest_path: str | None = None,
@@ -70,17 +71,22 @@ class VisualRetrievalAgentV2:
         infra_consecutive_threshold: int = 3,
         verbose: bool = True,
         # Deepsearch-specific params
-        max_deepsearch_rounds: int = 5,
+        max_deepsearch_rounds: int = 6,
         coarse_sample_frames: int = 16,
         use_cot: bool = True,
+        save_run_trace: bool = False,
     ) -> None:
         from src.utils.config import OPENAI_MODEL, get_llm_client
 
         self.client = get_llm_client()
         self.model = OPENAI_MODEL
         self.top_k = top_k
-        self.total_sample_frames = total_sample_frames
-        self.candidate_sample_frames = candidate_sample_frames
+        self.total_sample_frames = max(1, int(total_sample_frames))
+        if candidate_sample_frames is None:
+            self.candidate_sample_frames = self.total_sample_frames
+        else:
+            self.candidate_sample_frames = max(1, int(candidate_sample_frames))
+        self.candidate_video_height = max(1, int(candidate_video_height))
         self.max_reflect_rounds = max_reflect_rounds
         self.download_output_dir = str(Path(download_output_dir).resolve())
         self.oracle_map = load_oracle_map(oracle_manifest_path)
@@ -91,6 +97,7 @@ class VisualRetrievalAgentV2:
         self.max_deepsearch_rounds = max_deepsearch_rounds
         self.coarse_sample_frames = coarse_sample_frames
         self.use_cot = use_cot
+        self.save_run_trace = bool(save_run_trace)
         self._tls = threading.local()
 
     def set_log_file(self, path: str | None) -> None:
@@ -289,6 +296,7 @@ class VisualRetrievalAgentV2:
         cot_search_intent: str = "",
         cot_entities: dict[str, list[str]] | None = None,
         total_tokens: dict[str, int] | None = None,
+        run_trace: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run a single unified deepsearch loop.
 
@@ -308,8 +316,14 @@ class VisualRetrievalAgentV2:
         all_prev_queries: list[str] = []
 
         for round_num in range(1, self.max_deepsearch_rounds + 1):
+            round_trace_entry: dict[str, Any] | None = None
+            if run_trace is not None:
+                round_trace_entry = {"round": round_num, "query": current_keyword or ""}
+                run_trace.setdefault("rounds", []).append(round_trace_entry)
             if not current_keyword:
                 self._log("[DeepSearch] no keyword available; stopping")
+                if round_trace_entry is not None:
+                    round_trace_entry["stop_reason"] = "no_keyword_available"
                 break
 
             self._log(
@@ -323,6 +337,8 @@ class VisualRetrievalAgentV2:
             if not search_result.get("ok"):
                 reason = search_result.get("reason", "unknown")
                 self._log(f"[DeepSearch] search failed: {reason}")
+                if round_trace_entry is not None:
+                    round_trace_entry["search"] = {"ok": False, "reason": reason}
                 if round_num < self.max_deepsearch_rounds:
                     current_keyword, reflect_tokens = self._reflect_query(
                         input_frame_paths,
@@ -338,11 +354,20 @@ class VisualRetrievalAgentV2:
                             total_tokens[k] += reflect_tokens.get(k, 0)
                 else:
                     current_keyword = None
+                    if round_trace_entry is not None:
+                        round_trace_entry["stop_reason"] = "search_failed_final_round"
                 continue
 
             cand_ref = search_result["candidate_ref"]
             cand_title = search_result.get("title", "")
             self._log(f"[DeepSearch] found: {cand_title!r} ref={cand_ref}")
+            if round_trace_entry is not None:
+                round_trace_entry["search"] = {
+                    "ok": True,
+                    "candidate_ref": cand_ref,
+                    "candidate_title": cand_title,
+                    "candidate_url": search_result.get("url", ""),
+                }
 
             # --- Step 2: Download (async) ---
             dl_result = await tools.download_candidate_async(
@@ -352,6 +377,8 @@ class VisualRetrievalAgentV2:
                 code = str(dl_result.get("reason_code") or dl_result.get("reason") or "download_failed")
                 stderr = str(dl_result.get("stderr_tail") or "")[-300:]
                 self._log(f"[DeepSearch] download failed: {code}")
+                if round_trace_entry is not None:
+                    round_trace_entry["download"] = {"ok": False, "reason_code": code}
                 if stderr:
                     self._log(f"[DeepSearch] download stderr: {stderr}")
                 wrong_titles.append(cand_title)
@@ -370,11 +397,21 @@ class VisualRetrievalAgentV2:
                             total_tokens[k] += reflect_tokens.get(k, 0)
                 else:
                     current_keyword = None
+                    if round_trace_entry is not None:
+                        round_trace_entry["stop_reason"] = "download_failed_final_round"
                 continue
+            if round_trace_entry is not None:
+                round_trace_entry["download"] = {
+                    "ok": True,
+                    "video_path_saved": bool(dl_result.get("video_path")),
+                    "reused": bool(dl_result.get("reused", False)),
+                }
 
             candidate = session.candidates.get(cand_ref)
             if not candidate:
                 wrong_titles.append(cand_title)
+                if round_trace_entry is not None:
+                    round_trace_entry["stop_reason"] = "candidate_missing_after_download"
                 continue
 
             # --- Step 3: Coarse filter (16 frames -> relevance check) ---
@@ -388,6 +425,8 @@ class VisualRetrievalAgentV2:
             if not coarse_result.get("ok"):
                 self._log("[DeepSearch] coarse sample failed")
                 wrong_titles.append(cand_title)
+                if round_trace_entry is not None:
+                    round_trace_entry["coarse"] = {"sample_ok": False, "reason": "coarse_sample_failed"}
                 continue
 
             relevance = tools.check_coarse_relevance(
@@ -404,6 +443,12 @@ class VisualRetrievalAgentV2:
                 f"[DeepSearch] coarse relevance: {relevance['is_relevant']} "
                 f"({relevance['reasoning'][:100]})"
             )
+            if round_trace_entry is not None:
+                round_trace_entry["coarse"] = {
+                    "sample_ok": True,
+                    "is_relevant": bool(relevance["is_relevant"]),
+                    "reasoning": str(relevance.get("reasoning") or ""),
+                }
 
             if not relevance["is_relevant"]:
                 wrong_titles.append(cand_title)
@@ -422,6 +467,8 @@ class VisualRetrievalAgentV2:
                             total_tokens[k] += reflect_tokens.get(k, 0)
                 else:
                     current_keyword = None
+                    if round_trace_entry is not None:
+                        round_trace_entry["stop_reason"] = "coarse_not_relevant_final_round"
                 continue
 
             # --- Step 4: Fine filter (64 frames -> forgery points) ---
@@ -434,6 +481,8 @@ class VisualRetrievalAgentV2:
             )
             if not fine_result.get("ok"):
                 self._log("[DeepSearch] fine sample failed")
+                if round_trace_entry is not None:
+                    round_trace_entry["fine"] = {"sample_ok": False, "reason": "fine_sample_failed"}
                 continue
 
             forgery_result = tools.extract_fine_forgery_points(
@@ -452,6 +501,12 @@ class VisualRetrievalAgentV2:
             unique_new: list[dict[str, Any]] = []
             candidate_is_supporting_only = False
             self._log(f"[DeepSearch] fine extraction: {len(new_points)} forgery points")
+            if round_trace_entry is not None:
+                round_trace_entry["fine"] = {
+                    "sample_ok": True,
+                    "points_count": len(new_points),
+                    "source_description": source_description,
+                }
 
             if new_points:
                 # Deduplicate: skip points too similar to already-collected ones
@@ -514,8 +569,10 @@ class VisualRetrievalAgentV2:
                 next_step = tools.deepsearch_next_step(
                     source_like_points,
                     [{"title": v["title"], "url": v["url"]} for v in source_like_videos],
-                    source_descriptions=source_descriptions,
-                    prev_queries=all_prev_queries,
+                    source_descriptions,
+                    all_prev_queries,
+                    current_round=round_num,
+                    max_rounds=self.max_deepsearch_rounds,
                     physical_observations=cot_physical_observations,
                     logical_analysis=cot_logical_analysis,
                     search_intent=cot_search_intent,
@@ -526,6 +583,8 @@ class VisualRetrievalAgentV2:
                         total_tokens[k] += next_step.get("tokens", {}).get(k, 0)
             except Exception as exc:
                 self._log(f"[DeepSearch] next_step VLM call failed: {exc}")
+                if round_trace_entry is not None:
+                    round_trace_entry["next_step"] = {"ok": False, "error": str(exc)}
                 if round_num < self.max_deepsearch_rounds:
                     current_keyword, reflect_tokens = self._reflect_query(
                         input_frame_paths,
@@ -541,12 +600,22 @@ class VisualRetrievalAgentV2:
                             total_tokens[k] += reflect_tokens.get(k, 0)
                 else:
                     current_keyword = None
+                    if round_trace_entry is not None:
+                        round_trace_entry["stop_reason"] = "next_step_failed_final_round"
                 continue
 
             self._log(
                 f"[DeepSearch] sufficiency: {next_step['is_sufficient']} "
                 f"({next_step['reasoning'][:150]})"
             )
+            if round_trace_entry is not None:
+                round_trace_entry["next_step"] = {
+                    "ok": True,
+                    "is_sufficient": bool(next_step["is_sufficient"]),
+                    "reasoning": str(next_step.get("reasoning") or ""),
+                    "missing_description": str(next_step.get("missing_description") or ""),
+                    "next_keyword": str(next_step.get("next_keyword") or ""),
+                }
 
             if next_step["is_sufficient"]:
                 if not source_like_videos:
@@ -571,8 +640,12 @@ class VisualRetrievalAgentV2:
                                 total_tokens[k] += reflect_tokens.get(k, 0)
                     if current_keyword:
                         self._log(f"[DeepSearch] next keyword: {current_keyword!r}")
+                        if round_trace_entry is not None:
+                            round_trace_entry["next_keyword_selected"] = current_keyword
                         continue
                     self._log("[DeepSearch] no stronger next keyword available; stopping")
+                    if round_trace_entry is not None:
+                        round_trace_entry["stop_reason"] = "no_stronger_next_keyword"
                     break
 
                 resolved_video = source_like_videos[-1]
@@ -587,13 +660,22 @@ class VisualRetrievalAgentV2:
                 if resolved_url and resolved_url not in matched_urls:
                     matched_urls.append(resolved_url)
                 self._log("[DeepSearch] evidence sufficient; group resolved; stopping")
+                if round_trace_entry is not None:
+                    round_trace_entry["resolved"] = {
+                        "candidate_ref": resolved_ref,
+                        "resolved_url": resolved_url,
+                    }
                 break
 
             current_keyword = next_step.get("next_keyword", "")
             if current_keyword:
                 self._log(f"[DeepSearch] next keyword: {current_keyword!r}")
+                if round_trace_entry is not None:
+                    round_trace_entry["next_keyword_selected"] = current_keyword
             else:
                 self._log("[DeepSearch] no next keyword provided; stopping")
+                if round_trace_entry is not None:
+                    round_trace_entry["stop_reason"] = "no_next_keyword_provided"
                 break
 
         return {
@@ -625,6 +707,7 @@ class VisualRetrievalAgentV2:
             f"total_sample_frames={self.total_sample_frames}, "
             f"top_k={self.top_k}, "
             f"candidate_sample_frames={self.candidate_sample_frames}, "
+            f"candidate_video_height={self.candidate_video_height}, "
             f"coarse_sample_frames={self.coarse_sample_frames}, "
             f"max_deepsearch_rounds={self.max_deepsearch_rounds}, "
             f"max_reflect_rounds={self.max_reflect_rounds}, "
@@ -637,6 +720,23 @@ class VisualRetrievalAgentV2:
         total_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         try:
+            run_trace = None
+            if self.save_run_trace:
+                run_trace = {
+                    "input_video_id": Path(video_path).stem,
+                    "config": {
+                        "total_sample_frames": self.total_sample_frames,
+                        "candidate_sample_frames": self.candidate_sample_frames,
+                        "candidate_video_height": self.candidate_video_height,
+                        "coarse_sample_frames": self.coarse_sample_frames,
+                        "max_deepsearch_rounds": self.max_deepsearch_rounds,
+                        "max_reflect_rounds": self.max_reflect_rounds,
+                        "query_temperature": self.query_temperature,
+                        "use_cot": self.use_cot,
+                    },
+                    "cot": {},
+                    "rounds": [],
+                }
             # Step 1: Uniform frame sampling
             sampled_root = str(Path(temp_root) / "sampled_frames")
             frame_paths = uniform_sample_frames(
@@ -686,6 +786,7 @@ class VisualRetrievalAgentV2:
                 coarse_frames=self.coarse_sample_frames,
                 dense_frames=self.total_sample_frames,
                 query_temperature=self.query_temperature,
+                candidate_video_height=self.candidate_video_height,
             )
             cache_root = str(Path(temp_root) / "sampled_candidates_cache")
 
@@ -693,6 +794,16 @@ class VisualRetrievalAgentV2:
             if self.use_cot:
                 cot_result = self._cot_reasoning(frame_paths)
                 session.groups[0].physical_observations = cot_result["physical_observations"]
+                if run_trace is not None:
+                    run_trace["cot"] = {
+                        "reasoning": cot_result.get("reasoning", ""),
+                        "physical_observations": cot_result.get("physical_observations", ""),
+                        "logical_analysis": cot_result.get("logical_analysis", ""),
+                        "search_intent": cot_result.get("search_intent", ""),
+                        "entities": cot_result.get("entities", {}),
+                        "estimated_sources": cot_result.get("estimated_sources", 0),
+                        "source_queries": cot_result.get("source_queries", []),
+                    }
                 # Track COT tokens
                 cot_tokens = cot_result.get("tokens", {})
                 for k in total_tokens:
@@ -712,6 +823,16 @@ class VisualRetrievalAgentV2:
                     ],
                     "tokens": {},
                 }
+                if run_trace is not None:
+                    run_trace["cot"] = {
+                        "reasoning": cot_result.get("reasoning", ""),
+                        "physical_observations": "",
+                        "logical_analysis": "",
+                        "search_intent": "",
+                        "entities": cot_result.get("entities", {}),
+                        "estimated_sources": cot_result.get("estimated_sources", 0),
+                        "source_queries": cot_result.get("source_queries", []),
+                    }
 
             source_queries = cot_result["source_queries"]
 
@@ -745,6 +866,7 @@ class VisualRetrievalAgentV2:
                 cot_search_intent=cot_search_intent,
                 cot_entities=cot_entities,
                 total_tokens=total_tokens,
+                run_trace=run_trace,
             ))
 
             all_collected_points = ds_result["collected_points"]
@@ -869,6 +991,7 @@ class VisualRetrievalAgentV2:
                 },
                 "oracle_eval": oracle_eval,
                 "tokens": total_tokens,
+                "run_trace": run_trace or {},
             }
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
