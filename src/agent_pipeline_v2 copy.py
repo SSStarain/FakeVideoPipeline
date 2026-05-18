@@ -316,7 +316,6 @@ class VisualRetrievalAgentV2:
                 continue
 
             relevance = tools.check_coarse_relevance(
-                input_frame_paths,
                 coarse_result["frame_paths"],
                 physical_observations=cot_physical_observations,
                 temporal_analysis=cot_temporal_analysis,
@@ -349,7 +348,6 @@ class VisualRetrievalAgentV2:
                 continue
 
             forgery_result = tools.extract_fine_forgery_points(
-                input_frame_paths,
                 fine_result["frame_paths"],
                 physical_observations=cot_physical_observations,
                 temporal_analysis=cot_temporal_analysis,

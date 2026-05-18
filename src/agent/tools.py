@@ -973,21 +973,32 @@ class AgentTools:
     # ------------------------------------------------------------------
     def check_coarse_relevance(
         self,
+        forged_frame_paths: list[str],
         candidate_frame_paths: list[str],
         *,
         physical_observations: str = "",
         temporal_analysis: str = "",
     ) -> dict[str, Any]:
-        """Send candidate frames + text description to VLM for relevance judgment.
-
-        Only sends the candidate frames (not input frames) to save tokens.
-        The forged video is described via text from COT analysis.
-        """
+        """Coarse relevance over two frame groups: forged vs candidate."""
         prompt = PROMPT_COARSE_RELEVANCE.format(
             physical_observations=physical_observations or "(not available)",
             temporal_analysis=temporal_analysis or "(not available)",
         )
-        data = self._vlm_json_from_frames(candidate_frame_paths, prompt, temperature=0.2)
+        contents = _build_multimodal_content(
+            prompt + "\n\nFrame groups order:\n- First all images are Group A (forged).\n- Then all images are Group B (candidate).",
+            image_paths=[*forged_frame_paths, *candidate_frame_paths],
+        )
+        raw, _tokens = call_vlm_with_retry(
+            self.client,
+            self.model,
+            contents,
+            max_retries=3,
+            temperature=0.2,
+            json_mode=True,
+            logger=self.log,
+            log_prefix="[VLM] ",
+        )
+        data = extract_json_from_text(raw)
         return {
             "reasoning": str(data.get("reasoning") or "").strip(),
             "is_relevant": as_bool(data.get("is_relevant"), default=False),
@@ -995,25 +1006,34 @@ class AgentTools:
 
     def extract_fine_forgery_points(
         self,
+        forged_frame_paths: list[str],
         candidate_frame_paths: list[str],
         *,
         physical_observations: str = "",
         temporal_analysis: str = "",
         forbidden_overlay_text: str = "",
     ) -> dict[str, Any]:
-        """Send candidate frames + COT text to VLM for forgery point extraction.
-
-        The COT text lets the model compare source frames against the forgery
-        description instead of blindly guessing manipulation types.
-        """
+        """Fine-grained narrative forgery extraction over forged vs candidate."""
         prompt = PROMPT_FINE_FORGERY_POINTS.format(
             physical_observations=physical_observations or "(not available)",
             temporal_analysis=temporal_analysis or "(not available)",
             forbidden_overlay_text=forbidden_overlay_text or "(none found)",
         )
-        data = self._vlm_json_from_frames(
-            candidate_frame_paths, prompt, temperature=0.2
+        contents = _build_multimodal_content(
+            prompt + "\n\nFrame groups order:\n- First all images are Group A (forged).\n- Then all images are Group B (candidate).",
+            image_paths=[*forged_frame_paths, *candidate_frame_paths],
         )
+        raw, _tokens = call_vlm_with_retry(
+            self.client,
+            self.model,
+            contents,
+            max_retries=3,
+            temperature=0.2,
+            json_mode=True,
+            logger=self.log,
+            log_prefix="[VLM] ",
+        )
+        data = extract_json_from_text(raw)
         raw_points = data.get("points") or []
         points = []
         if isinstance(raw_points, list):
