@@ -17,67 +17,53 @@ from __future__ import annotations
 # Stage A - retrieval agent
 # ============================================================
 
-PROMPT_REFLECT_REFINE = """You are an OSINT Agent in an iterative search loop. Previous queries did NOT find the original video.
-
-CRITICAL CONTEXT: The input video is a SUSPECTED FORGERY assembled from real source clips. The forger has almost certainly added their own caption / subtitle / UI layer on top of the real footage. If previous queries echoed the forger's overlay text (subtitle bars, translation banners, dramatic captions, video-player UI), they will land on the WRONG videos - exactly what just happened.
+PROMPT_REFLECT_REFINE = """You are a video retrieval strategist working inside an iterative search loop. Previous YouTube queries did NOT find a useful source video.
 
 CONTEXT OF FAILURE:
 - Previously tried queries: {prev_queries}
 - WRONG candidate titles returned by those queries: {candidate_titles}
-- The visual environment / event in those candidates did not match the input frames.
 
-THINK STEP BY STEP (silent chain-of-thought - write your full reasoning in the `reasoning` field):
-Step 0 (overlay triage of failed queries - MANDATORY FIRST STEP). Look at the input frames again and list every piece of on-screen text. Classify each as PHYSICAL (printed on a real object in the scene) or OVERLAY (added on top: subtitle bar, translation banner, video-player UI, caption added by reposter). For every previous query that copied or paraphrased an OVERLAY string, mark that whole string as POISONED - it CAUSED the wrong candidates and must never be reused. Put POISONED overlay strings into `negative_keywords`.
-Step 1. Identify which specific proper nouns or brand names in the previous queries pulled the WRONG candidates. Only add those specific terms to `negative_keywords`. DO NOT add generic words from your own previous queries (like "camping", "weather", "spicy", "fire", "forest") - those may be part of the correct title. DO NOT add words that merely appeared in wrong candidate titles IF those words are common genre vocabulary.
+PRIOR COT ANALYSIS OF THE INPUT VIDEO:
+- Physical observations: {physical_observations}
+- Logical analysis: {logical_analysis}
+- Search intent: {search_intent}
+- Entities summary: {entities_summary}
 
-STRICT negative_keywords RULES:
-  - YES, add: exact overlay text phrases, specific brand names that pulled wrong videos, specific proper nouns from overlay text
-  - NO, do NOT add: common descriptive words that could appear in the real title (cooking, tips, challenge, compilation, vlog, survival, weather, caught on camera, moments, fire, forest, family, tutorial, guide, for beginners, review, storm, flood, highlights, sports, outdoors)
-  - NO, do NOT add: words from your OWN previous title guesses - if your title guess contained a word, do not then block it
-  - NO, do NOT add: generic word roots - add only the EXACT word that appeared, not its derivatives
-  - RULE OF THUMB: when in doubt, do NOT add a word to negative_keywords. It is better to reuse a word than to block a term that might be in the real title.
+YOUR JOB: look at the input frames again, study the failed candidate titles, diagnose why retrieval drifted, and produce three stronger follow-up queries.
 
-Step 2. PRETEND YOU ARE THE UPLOADER of the ORIGINAL YouTube video. Imagine the forger's caption / subtitle / UI layer is completely erased - what does the bare footage show? Answer these two questions FIRST (they guide your title guesses):
-   a) What CATEGORY of YouTube content is this? (cooking, tutorial, travel, news, challenge, vlog, compilation, sports, comedy, review, science, art, nature, etc. - pick whatever fits the BARE FOOTAGE)
-   b) What 3-5 GENERIC words would a VIEWER type into YouTube search to find this kind of content?
-Looking at the bare footage AND the wrong candidate titles together, write 2-3 FRESH title guesses for the actual source. They MUST AVOID every term in `negative_keywords` but SHOULD USE the search vocabulary from 2b. These are full title sentences (~6-14 words) of the kind that ACTUALLY appears as a YouTube video title.
+THINK STEP BY STEP (write your full reasoning in the `reasoning` field):
+Step 1. Re-understand the input video from the frames:
+  - What are the most diagnostic anchors: named people, program names, event names, competition names, locations, dates, logos, uniforms, scene types, or specific actions?
+  - Which of those anchors are most likely to appear in the original uploader's title or in strong retrieval results?
 
-CRITICAL: YouTube creators use SHORT, CONCEPTUAL titles - NOT forensic descriptions of specific objects. Think like a CREATOR, not an analyst. Your title guesses MUST use the generic search vocabulary from 2b. At least ONE title guess must be a broad conceptual title (no brand names, no specific tool names). Match the register of the BARE FOOTAGE, not the forger's dramatic captions.
-Step 3. Derive 3 new queries from your fresh title guesses. Each query is a shorter (5-12 word) subset of one guess. None may contain or paraphrase any term in `negative_keywords`. Each query should look like a piece of a literal YouTube title.
+Step 2. Diagnose the failure mode:
+  - Did previous queries over-focus on the wrong person, event, program, location, or date?
+  - Were they too broad, too narrow, or anchored on a side detail instead of the main verifiable fact?
+  - Did the wrong candidate titles suggest a different topic cluster than what the input frames actually show?
 
-NEGATIVE-KEYWORD RULE: Do NOT reuse any term in `negative_keywords`. If a wrong topic word would still help, use a YouTube exclude operator like `-someword` to suppress that match.
+Step 3. Produce `negative_keywords` conservatively:
+  - Add ONLY specific entities, titles, locations, dates, or topic anchors that clearly pulled retrieval into the wrong result cluster.
+  - Do NOT add broad genre words that could still belong to the right title.
+  - When unsure, leave a term out. It is better to keep a reusable word than to block a potentially correct one.
 
-IMPORTANT: `negative_keywords` must contain ONLY: (1) exact overlay text phrases, (2) specific brand/proper-nouns that pulled wrong videos, or (3) specific terms from wrong candidate titles that are clearly NOT part of the real title. NEVER add common descriptive words. NEVER add words from your own title guesses. If you are unsure whether a word should be negative, DO NOT add it.
+Step 4. Generate 3 fresh search queries:
+  - `new_queries[0]`: the strongest entity/event/title angle
+  - `new_queries[1]`: a different angle using location/date/program/visual cue
+  - `new_queries[2]`: a broader but still concrete fallback query that would help find the original or a closely related source
 
-MULTILINGUAL RULE: If the input frames contain non-Latin characters (Chinese / Japanese / Korean / Arabic / Russian / Thai / Cyrillic / etc.) PRINTED ON A PHYSICAL OBJECT in the scene (shop sign, packaging, road sign, jersey, building, menu, t-shirt - NOT inside an overlay subtitle bar / translation banner), ONE of the new queries MUST be in that script, copying the visible characters verbatim. If non-Latin characters appear ONLY inside overlay subtitles / translation banners added by the forger, DO NOT use them - they are poisoned and belong in `negative_keywords`.
-
-QUERY SLOT REQUIREMENTS (STRICT - overlay text forbidden in every slot):
-   - new_queries[0]: a FRESH event-scene angle using a PHYSICAL cue you missed (an object, a venue type, a kinetic action, a holiday / season / location cue inferred from the bare footage). May reuse 1 proper noun if it is the strongest anchor and is NOT in `negative_keywords`.
-   - new_queries[1]: an entity / PHYSICAL-OCR / multilingual angle, possibly with a `-negative_keyword` YouTube exclude operator. Different from new_queries[0]. This is the slot to use for a CJK / non-Latin query IF AND ONLY IF the multilingual rule applies (i.e., the CJK characters are physically printed in the scene).
-   - new_queries[2]: GENERIC CONCEPTUAL TITLE (MANDATORY - NO specific objects/brands): Ask: "If I were the YouTube creator, what would the TITLE be?" Use the search vocabulary from Step 2b. NO brand names, NO specific tool names, NO proper nouns, NO forensic descriptions. This must sound like a real YouTube title. Use ONE of these structural patterns (fill <topic> with your search vocabulary):
-        * "<topic> compilation"
-        * "<topic> caught on camera"
-        * "<topic> moments"
-        * "<topic> vlog"
-        * "<N> <topic> tips"
-        * "<topic> tips in <duration>"
-        * "<topic> tutorial"
-        * "how to <topic>"
-        * "best of <topic>"
-        * "I tried <topic>"
-        * "<topic> review"
-        * "<topic> in <N> minutes"
-        * "<topic> for beginners"
-     This is the SINGLE most reliable fallback when previous specific queries failed. Generate it EVEN IF the previous queries already looked broad.
-
-At least ONE of the 3 new queries MUST be a direct shortened version (5-12 words) of one of your fresh title guesses from Step 2. Title-derived queries are the MOST LIKELY to match the real source video - this is not optional.
+QUERY RULES:
+- Queries must be plain YouTube search text, 5-12 words each.
+- Queries should sound like plausible title fragments or high-value search phrases, not forensic notes.
+- Avoid reusing any term in `negative_keywords` unless it is part of an explicit exclude operator like `-term`.
+- At least ONE query must be a direct shortened version of a plausible real title.
+- The 3 queries must be meaningfully different from one another.
 
 OUTPUT JSON FORMAT:
 {
-  "reasoning": "Step 0: <which previous queries echoed OVERLAY text and are now poisoned>. Step 1: <topic-word negatives from wrong titles>. Step 2: <2-3 fresh LITERAL title guesses based on bare footage that avoid all negatives>. Step 3: <how each new query maps to a title guess; confirm none use overlay text or negatives>.",
-  "reflection": "Which keyword(s) caused the wrong candidates (overlay-poisoned and/or topic-poisoned) and what fresh clue(s) you re-prioritized.",
-  "negative_keywords": ["overlay_or_topic_term1", "term2"],
-  "new_queries": ["plain query 1", "plain query 2", "broad pure-visual or aggregator-style plain query 3"]
+  "reasoning": "Step 1: <what the video most likely shows>. Step 2: <why previous searches failed>. Step 3: <which specific anchors were treated as negatives>. Step 4: <how each new query improves retrieval>.",
+  "reflection": "Short explanation of what retrieval signal was re-prioritized.",
+  "negative_keywords": ["wrong_entity_or_topic_1", "wrong_entity_or_topic_2"],
+  "new_queries": ["plain query 1", "plain query 2", "plain query 3"]
 }"""
 
 
@@ -178,63 +164,70 @@ OUTPUT JSON FORMAT:
 
 PROMPT_COT_RETRIEVAL_V3 = """You are a video forensic analyst. You will see 64 frames uniformly sampled from a video that may contain misinformation.
 
-Your task is to deeply understand the video content, identify key entities and potential logical anomalies, and generate a precise initial search query to help find the original video that can verify or reconstruct the truth in a later retrieval stage.
+Your task is to deeply understand the video content, identify key entities and potential logical anomalies, and produce the initial retrieval plan for finding original or closely related source videos on YouTube.
 
-Think step by step (write your full reasoning in the reasoning field):
+Think step by step (write your full reasoning in the `reasoning` field):
 
 == Step 1: Content Understanding ==
 
 Examine the 64 frames as a timeline:
 
-a) What different scenes/environments appear in the video? Briefly describe each scene.
+a) What different scenes, environments, or camera setups appear in the video? Briefly describe each one.
 
 b) Identify the key entities and information in the video:
-   - People: Who appears? Can you identify specific individuals, such as celebrities, athletes, or political figures? What are their appearance, clothing, and surroundings?
-   - Locations: Where is it? Are there identifiable landmarks, signs, logos, or architectural styles?
-   - Events: What is happening? A sports match, variety show, news event, everyday scene?
-   - Time: Can any time information be inferred? For example, dates in broadcast graphics, seasonal clues, or the era suggested by equipment.
-   - On-screen text: What does all readable text in the frame say, including captions, news headlines, program logos, scoreboards, signs, etc.? What facts do these texts claim or imply?
+   - People: Who appears? Can you identify specific individuals such as celebrities, athletes, presenters, politicians, or creators?
+   - Locations: Are there identifiable landmarks, venue cues, signs, architectural styles, neighborhoods, or countries?
+   - Events: What is happening? A sports match, program segment, performance, interview, protest, news event, travel clip, everyday scene?
+   - Time: Can you infer dates, seasons, eras, or broadcast periods?
+   - On-screen text: What readable text seems semantically meaningful for identifying the content, such as names, event titles, program logos, scoreboards, venue text, headlines, or captions that appear integral to the footage? Ignore obvious platform chrome like playback controls, timestamps, or menus.
 
-c) Are there discontinuities between scenes, such as sudden changes in lighting, resolution, or environment, suggesting the footage may come from multiple sources?
+c) Are there discontinuities between scenes, such as sudden changes in environment, production style, resolution, or topic, suggesting multiple original sources?
 
 == Step 2: Logical Reasoning ==
 
-Combine visual information, text information, and common sense to look for potential logical contradictions or anomalies:
+Combine visual information, text information, and common sense to look for potential anomalies or verification targets:
 
-- Are the facts claimed or implied in the video, through visuals, text, or event sequence, consistent with common sense or known facts?
-- Are there unreasonable links between people, locations, or times across different scenes?
-- Are there events that could not have happened at the same time but appear to be edited together?
-- Is there any contradiction between the visual content and the on-screen text?
-- If no obvious contradiction is found, explain the key fact that is most worth verifying.
+- Are the facts claimed or implied by the video internally consistent?
+- Are there unreasonable links between people, locations, times, or events across scenes?
+- Are there scenes that look edited together from different sources?
+- Is there a specific claim, identity, location, or event that is most worth verifying first?
+- If there is no obvious contradiction, explain what the most valuable verification target would be.
 
-== Step 3: Search Strategy ==
+== Step 3: Retrieval Planning ==
 
-Based on Step 1 and Step 2, determine your first search target:
+Based on Step 1 and Step 2, determine the best initial retrieval plan:
 
-- What are you going to search for? For example, a person’s real experience, an original report of an event, or the original source of a piece of footage.
-- Why choose this as the first search target? For example, it contains the most information, is easiest to verify, or is most likely to match the original video.
-- Generate a YouTube search query of 5–12 words.
+- What should be searched first, and why?
+- Estimate how many distinct original sources are likely present.
+- For each likely source or distinct scene family, produce ONE high-value YouTube search query of 5-12 words.
 
 Query strategy:
-- Prioritize specific entities you have identified: people’s names, program names, event names, location names, and dates.
-- If you can identify a specific person + event, combine them directly, such as "Messi goal France 2022 World Cup final".
-- If you identify a program or competition, use the program name + key person or key plot point, such as "America's Got Talent Jessica Sanchez audition".
-- If you cannot identify specific entities, use the content category + the most distinctive visual feature, such as "Bangkok street food night market".
-- Key information from on-screen text, such as program names, people’s names, or event names, can be included as part of the search terms.
+- Prioritize specific people, event names, program names, competition names, locations, dates, and distinctive scene cues.
+- If a named person + event is identifiable, combine them directly.
+- If a program, broadcast, or competition is identifiable, use that as a strong anchor.
+- If no specific entity is reliable, use the content category plus the most distinctive visual cue.
+- Queries should sound like plausible YouTube title fragments or high-value search phrases, not forensic notes.
 
-Output in JSON format:
+OUTPUT JSON FORMAT:
 {
-  "reasoning": "Step 1: <content understanding, including scenes, entities, and text information>. Step 2: <logical reasoning, contradictions found or facts that need verification>. Step 3: <search strategy selection and query derivation>.",
+  "reasoning": "Step 1: <content understanding>. Step 2: <logical reasoning>. Step 3: <retrieval planning and query derivation>.",
   "entities": {
-    "people": ["list of identified people"],
-    "locations": ["list of identified locations"],
+    "people": ["identified people"],
+    "locations": ["identified locations"],
     "events": ["identified events/programs/competitions"],
-    "text_claims": ["key facts claimed by on-screen text"]
+    "text_claims": ["key facts or labels conveyed by on-screen text"]
   },
-  "logical_analysis": "Logical analysis of the video content, including any contradictions found or key facts that need verification. If no obvious contradiction is found, explain what is most worth verifying.",
-  "physical_observations": "Summarize the most searchable visual clues in 3–5 sentences.",
-  "search_intent": "The purpose of this search, such as verifying a person’s identity, finding the original report of an event, or locating the source of the footage.",
-  "initial_query": "A search query of 5–12 words"
+  "logical_analysis": "Logical analysis of the video content, including contradictions found or the main fact that should be verified first.",
+  "physical_observations": "Summarize the most searchable visual clues in 3-5 sentences.",
+  "search_intent": "What this retrieval should verify or reconstruct first.",
+  "estimated_sources": 1,
+  "source_queries": [
+    {
+      "source_label": "source_1: brief description of the scene or source family",
+      "queries": ["one 5-12 word YouTube search query"]
+    }
+  ],
+  "initial_query": "single best first query, usually the same as the strongest source query"
 }"""
 
 
@@ -246,16 +239,20 @@ You will see TWO frame groups:
 
 CONTEXT FROM PRIOR COT ANALYSIS:
 - Physical observations: {physical_observations}
-- Temporal analysis: {temporal_analysis}
+- Logical analysis: {logical_analysis}
+- Search intent: {search_intent}
 
-YOUR TASK: judge whether Group B is likely from the SAME EVENT / SAME REAL-WORLD SCENE FAMILY as Group A (or a close same-topic source worth keeping).
+YOUR TASK: judge whether Group B is useful retrieval evidence for Group A. The candidate can be:
+- the same original footage,
+- a closely related upload of the same event or scene family,
+- or a video that would materially help verify the main fact or claim in Group A.
 
 CRITICAL EVALUATION RULES:
 1. This is a COARSE FILTER with HIGH RECALL. Prefer false positives over false negatives.
 2. Do NOT rely on pixel-level similarity.
 3. Ignore differences caused by compression, bitrate, resolution, color grading, subtitles, black bars, crop, mirror, small timing offset, and camera/viewpoint variation.
-4. Focus on semantic anchors: event type, scene layout, recurring objects, role relations, action pattern, and temporal storyline.
-5. If Group B could plausibly provide source-side evidence for Group A's narrative, mark relevant.
+4. Focus on semantic anchors: event type, named entities, venue/program cues, recurring objects, role relations, action pattern, and storyline.
+5. If Group B could plausibly help verify the same identity, event, location, or claim as Group A, mark relevant.
 6. Only mark irrelevant when topics/scenes are clearly different.
 
 OUTPUT JSON FORMAT:
@@ -271,15 +268,16 @@ PROMPT_FINE_FORGERY_POINTS = """You are a forensic video analyst comparing:
 
 PRIOR CONTEXT:
 - Physical observations: {physical_observations}
-- Temporal analysis: {temporal_analysis}
-- Overlaid/fake text found in the forgery: {forbidden_overlay_text}
+- Logical analysis: {logical_analysis}
+- Search intent: {search_intent}
+- Entities summary: {entities_summary}
 
 YOUR TASK: Do a cross-group semantic comparison and extract NARRATIVE-LEVEL forgery points.
 This is NOT pixel matching. You must tolerate quality/angle/edit differences and focus on story distortion.
 
 THINK IN THIS ORDER (write reasoning in source_description):
 1. OVERALL ALIGNMENT: summarize what real event/activity Group B likely shows, and how it aligns with Group A's underlying footage.
-2. MANIPULATION IMPACT: explain how Group A reframes, exaggerates, fabricates context, or changes causality versus Group B.
+2. MANIPULATION IMPACT: explain how Group A reframes, exaggerates, fabricates context, changes causality, or invites a misleading interpretation versus Group B.
 3. DEDUPLICATE: each point must cover a unique manipulation aspect.
 
 OUTPUT JSON FORMAT (strict, no extra text, NO code fences):
@@ -303,12 +301,13 @@ PROMPT_DEEPSEARCH_NEXT_STEP = """You are the decision-maker in a deep-search loo
 
 CONTEXT (do NOT echo back):
 
-— What the forgery looks like (from COT analysis of the forged video):
+— What the video looks like (from COT analysis of the input video):
 - Physical observations: {physical_observations}
-- Temporal analysis: {temporal_analysis}
-- Fake overlay text added by forger: {forbidden_overlay_text}
+- Logical analysis: {logical_analysis}
+- Search intent: {search_intent}
+- Entities summary: {entities_summary}
 
-— Estimated original sources:
+— Estimated source families / scene groups:
 {source_descriptions}
 
 — Forgery evidence collected so far:
@@ -322,30 +321,31 @@ CONTEXT (do NOT echo back):
 
 YOUR JOB (two tasks in one response):
 
-TASK 1 — SUFFICIENCY JUDGMENT: Compare what you KNOW about the forgery against what you've COLLECTED. Judge whether the evidence is SUFFICIENT.
+TASK 1 — SUFFICIENCY JUDGMENT: Compare what you KNOW about the input video against what you've COLLECTED. Judge whether the evidence is SUFFICIENT.
 
 THINK STEP BY STEP for sufficiency:
-1. Based on temporal_analysis, how many distinct original sources were spliced together? Have we found evidence for each?
-2. Based on physical_observations, what specific scenes/activities exist? Do the collected points cover the manipulation of each scene?
-3. Based on forbidden_overlay_text, what fake text/narrative was added? Do any collected points address this?
-4. Is there any major manipulation aspect that NO collected point covers?
+1. Based on the source descriptions, how many distinct source families or scenes likely matter? Have we found evidence for each?
+2. Based on physical_observations and logical_analysis, what identities, events, locations, or claims must be verified? Do the collected points cover them?
+3. Does the examined evidence explain the main misleading interpretation or unresolved factual question?
+4. Is there any major scene, claim, or verification target that NO collected point covers?
 
 CRITICAL RULES:
-- For SINGLE-SOURCE forgery (estimated_sources=1): Finding ONE topically relevant video with 3+ forgery points IS sufficient. You do NOT need the exact original video — any video showing the same topic/activity provides enough forensic basis. Stop searching.
-- For MULTI-SOURCE forgery (estimated_sources>1): You need evidence covering EACH distinct source. Count how many sources you've found vs how many are estimated.
-- NEVER keep searching just because "the source video is not the exact same one." The goal is to analyze the FORGERY PATTERN, not identify the precise source.
+- For a SINGLE dominant source: do NOT stop merely because you found a topically related video. The examined evidence should strongly suggest the same program, same event, same source family, or a near-duplicate upload of the same underlying footage.
+- If the current evidence mainly highlights that Group A and Group B are from different eras, different shows, different productions, or different contexts, that is evidence of topical relatedness, NOT sufficient source resolution. Keep searching.
+- For MULTI-SOURCE or MULTI-SCENE cases: you need evidence that covers EACH major source family or unresolved scene cluster.
+- Prefer precision over early stopping. It is acceptable to continue searching when the current best evidence is only "related but not same-source enough."
 
 TASK 2 — NEXT KEYWORD (only if NOT sufficient): Generate the SINGLE best YouTube search query to find the next missing original source.
 
 THINK STEP BY STEP for keyword generation:
-1. Which estimated source has NOT been found yet?
-2. What specific physical content (NOT overlay text) distinguishes the missing source?
-3. Generate ONE search query (5-12 words). Think like a YouTube creator for the title, NOT like a forensic analyst.
-4. The query MUST NOT use any text from forbidden_overlay_text.
+1. Which source family, identity, event, location, or claim is still unresolved?
+2. What specific distinguishing cue would most likely retrieve useful evidence for it?
+3. Generate ONE search query (5-12 words) using the strongest identifying anchor available.
+4. Prefer a query that could plausibly match a real YouTube title or high-value search phrase.
 
 OUTPUT JSON FORMAT:
 {{
-  "reasoning": "Step-by-step: what the forgery contains vs what evidence is collected, what's missing.",
+  "reasoning": "Step-by-step: what the forgery contains vs what evidence is collected, whether the current evidence is same-source enough, and what's still missing.",
   "is_sufficient": true | false,
   "missing_description": "If insufficient, describe exactly what evidence is missing. If sufficient, empty string.",
   "next_keyword": "If insufficient, ONE best search query (5-12 words). If sufficient, empty string."

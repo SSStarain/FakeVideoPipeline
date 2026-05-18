@@ -977,12 +977,14 @@ class AgentTools:
         candidate_frame_paths: list[str],
         *,
         physical_observations: str = "",
-        temporal_analysis: str = "",
+        logical_analysis: str = "",
+        search_intent: str = "",
     ) -> dict[str, Any]:
         """Coarse relevance over two frame groups: forged vs candidate."""
         prompt = PROMPT_COARSE_RELEVANCE.format(
             physical_observations=physical_observations or "(not available)",
-            temporal_analysis=temporal_analysis or "(not available)",
+            logical_analysis=logical_analysis or "(not available)",
+            search_intent=search_intent or "(not available)",
         )
         contents = _build_multimodal_content(
             prompt + "\n\nFrame groups order:\n- First all images are Group A (forged).\n- Then all images are Group B (candidate).",
@@ -1002,6 +1004,7 @@ class AgentTools:
         return {
             "reasoning": str(data.get("reasoning") or "").strip(),
             "is_relevant": as_bool(data.get("is_relevant"), default=False),
+            "tokens": _tokens or {},
         }
 
     def extract_fine_forgery_points(
@@ -1010,14 +1013,17 @@ class AgentTools:
         candidate_frame_paths: list[str],
         *,
         physical_observations: str = "",
-        temporal_analysis: str = "",
-        forbidden_overlay_text: str = "",
+        logical_analysis: str = "",
+        search_intent: str = "",
+        entities: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         """Fine-grained narrative forgery extraction over forged vs candidate."""
+        entities_summary = json.dumps(entities or {}, ensure_ascii=False)
         prompt = PROMPT_FINE_FORGERY_POINTS.format(
             physical_observations=physical_observations or "(not available)",
-            temporal_analysis=temporal_analysis or "(not available)",
-            forbidden_overlay_text=forbidden_overlay_text or "(none found)",
+            logical_analysis=logical_analysis or "(not available)",
+            search_intent=search_intent or "(not available)",
+            entities_summary=entities_summary,
         )
         contents = _build_multimodal_content(
             prompt + "\n\nFrame groups order:\n- First all images are Group A (forged).\n- Then all images are Group B (candidate).",
@@ -1045,6 +1051,7 @@ class AgentTools:
         return {
             "source_description": str(data.get("source_description") or "").strip(),
             "points": points,
+            "tokens": _tokens or {},
         }
 
     def deepsearch_next_step(
@@ -1055,8 +1062,9 @@ class AgentTools:
         prev_queries: list[str],
         *,
         physical_observations: str = "",
-        temporal_analysis: str = "",
-        forbidden_overlay_text: str = "",
+        logical_analysis: str = "",
+        search_intent: str = "",
+        entities: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         """Combined sufficiency judgment + next keyword generation.
 
@@ -1086,11 +1094,13 @@ class AgentTools:
 
         # Format previous queries
         q_str = "\n".join(f"  - {q}" for q in prev_queries) if prev_queries else "  (none)"
+        entities_summary = json.dumps(entities or {}, ensure_ascii=False)
 
         prompt = PROMPT_DEEPSEARCH_NEXT_STEP.format(
             physical_observations=physical_observations or "(not available)",
-            temporal_analysis=temporal_analysis or "(not available)",
-            forbidden_overlay_text=forbidden_overlay_text or "(none)",
+            logical_analysis=logical_analysis or "(not available)",
+            search_intent=search_intent or "(not available)",
+            entities_summary=entities_summary,
             source_descriptions=src_str,
             collected_points=points_str,
             examined_videos=videos_str,
@@ -1113,4 +1123,5 @@ class AgentTools:
             "is_sufficient": as_bool(data.get("is_sufficient"), default=False),
             "missing_description": str(data.get("missing_description") or "").strip(),
             "next_keyword": str(data.get("next_keyword") or "").strip(),
+            "tokens": _tokens or {},
         }
