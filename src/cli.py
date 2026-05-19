@@ -44,7 +44,7 @@ from src.agent.oracle_eval import (  # noqa: E402
     load_manifest_entries,
 )
 from src.agent_pipeline_v2 import VisualRetrievalAgentV2  # noqa: E402
-from src.utils.config import OPENAI_MODEL, get_llm_client  # noqa: E402
+from src.utils.config import get_llm_client  # noqa: E402
 from src.utils.pipeline_log import default_log_path, tee_stdout  # noqa: E402
 
 
@@ -552,7 +552,7 @@ def _process_one_inner(
 
     gt_points = extract_groundtruth(entry)
     score_result: dict[str, Any] | None = None
-    if not skip_judge and gt_points:
+    if not skip_judge and gt_points and collected_points:
         print(f"=== Stage C: judging ({video_id}) ===", flush=True)
         try:
             score_result = judge_points(
@@ -567,13 +567,33 @@ def _process_one_inner(
             print(f"[Orchestrator] {video_id}: Stage C failed: {exc}", flush=True)
             score_result = {
                 "video_id": video_id,
+                "judge_models": judge_models,
+                "n_gt": len(gt_points),
+                "passed_gt_count": 0,
                 "hits": 0,
                 "score": 0.0,
-                "matches": [],
+                "gt_vote_results": [],
+                "judge_results": [],
                 "comment": "",
                 "ok": False,
                 "error": f"judge_failed: {exc}",
             }
+    elif not skip_judge and gt_points and not collected_points:
+        print(f"[Orchestrator] {video_id}: no predicted forgery points; skipping Stage C judge", flush=True)
+        score_result = {
+            "video_id": video_id,
+            "judge_models": judge_models,
+            "n_gt": len(gt_points),
+            "passed_gt_count": 0,
+            "hits": 0,
+            "score": 0.0,
+            "gt_vote_results": [],
+            "judge_results": [],
+            "comment": "",
+            "ok": False,
+            "error": None,
+            "skipped_reason": "no_pred_points",
+        }
     elif skip_judge:
         print(f"[Orchestrator] {video_id}: --skip-judge in effect; skipping Stage C", flush=True)
     else:
@@ -585,6 +605,7 @@ def _process_one_inner(
         "n_gt": int((score_result or {}).get("n_gt", len(gt_points)) or 0),
         "passed_gt_count": int((score_result or {}).get("passed_gt_count", 0) or 0),
         "score": float((score_result or {}).get("score", 0.0) or 0.0) if score_result else None,
+        "skipped_reason": (score_result or {}).get("skipped_reason"),
     }
     record = {
         "video_id": video_id,

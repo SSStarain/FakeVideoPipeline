@@ -50,6 +50,7 @@ _DEFAULT_PLAYER_CLIENTS = "web,android"
 # YouTube download trips "Sign in to confirm you're not a bot" / 403. We try deno
 # first (default), then node/bun.
 _JS_RUNTIME_CANDIDATES = ("deno", "node", "bun")
+_DOWNLOAD_TIMEOUT_SECONDS = 240
 
 
 def _detect_js_runtime() -> tuple[str, str] | None:
@@ -620,12 +621,19 @@ class AgentTools:
 
         # Single-file mp4 first to avoid merge dependency; merged formats as fallback.
         max_height = self.candidate_video_height
-        format_selector = (
-            f"best[ext=mp4][height<={max_height}]/best[ext=mp4]/"
-            f"bv*[height<={max_height}]+ba/best[height<={max_height}]/best"
-        )
+        format_selectors = [
+            (
+                "primary",
+                f"best[ext=mp4][height<={max_height}]/best[ext=mp4]/"
+                f"bv*[height<={max_height}]+ba/best[height<={max_height}]/best",
+            ),
+            (
+                "fallback_lowres",
+                f"worst[ext=mp4][height<={max_height}]/worst[height<={max_height}]/worst",
+            ),
+        ]
 
-        def _build_cmd(use_browser_cookies: bool) -> list[str]:
+        def _build_cmd(use_browser_cookies: bool, format_selector: str) -> list[str]:
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
@@ -643,74 +651,87 @@ class AgentTools:
             return cmd
 
         attempts: list[dict[str, str]] = []
-        first_try = _build_cmd(use_browser_cookies=False)
-        try:
-            subprocess.run(first_try, capture_output=True, text=True, check=True, timeout=120)
-            err: subprocess.CalledProcessError | None = None
-        except subprocess.CalledProcessError as exc:
-            err = exc
-            stderr_tail = (exc.stderr or "").strip()[-500:]
-            attempts.append(
-                {"strategy": "cookies_file", "reason_code": _classify_ytdlp_failure(stderr_tail)}
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "reason": "download_timeout",
-                "reason_code": "timeout",
-                "attempts": [{"strategy": "cookies_file", "reason_code": "timeout"}],
-            }
-        else:
-            err = None
+        err: subprocess.CalledProcessError | None = None
+        stderr_tail = ""
+        reason_code = "unknown"
+        success = False
 
-        if err is not None:
-            stderr_tail = (err.stderr or "").strip()[-500:]
-            reason_code = _classify_ytdlp_failure(stderr_tail)
-            # Fallback retry with --cookies-from-browser if env-configured and the
-            # failure looks recoverable (auth/bot/age).
+        for selector_name, format_selector in format_selectors:
+            try:
+                subprocess.run(
+                    _build_cmd(use_browser_cookies=False, format_selector=format_selector),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=_DOWNLOAD_TIMEOUT_SECONDS,
+                )
+                success = True
+                break
+            except subprocess.CalledProcessError as exc:
+                err = exc
+                stderr_tail = (exc.stderr or "").strip()[-500:]
+                reason_code = _classify_ytdlp_failure(stderr_tail)
+                attempts.append(
+                    {
+                        "strategy": f"cookies_file:{selector_name}",
+                        "reason_code": reason_code,
+                    }
+                )
+            except subprocess.TimeoutExpired:
+                attempts.append(
+                    {
+                        "strategy": f"cookies_file:{selector_name}",
+                        "reason_code": "timeout",
+                    }
+                )
+                reason_code = "timeout"
+                continue
+
             if (
                 self._cookies_browser
                 and reason_code in {"http_403_bot_check", "age_restricted", "private_video"}
             ):
                 self.log(
                     f"[yt-dlp] retrying download with --cookies-from-browser={self._cookies_browser} "
-                    f"after reason_code={reason_code}"
+                    f"after reason_code={reason_code} selector={selector_name}"
                 )
                 try:
                     subprocess.run(
-                        _build_cmd(use_browser_cookies=True),
+                        _build_cmd(use_browser_cookies=True, format_selector=format_selector),
                         capture_output=True,
                         text=True,
                         check=True,
-                        timeout=120,
+                        timeout=_DOWNLOAD_TIMEOUT_SECONDS,
                     )
-                    err = None
+                    success = True
+                    break
                 except subprocess.CalledProcessError as exc2:
                     err = exc2
-                    stderr_tail2 = (exc2.stderr or "").strip()[-500:]
+                    stderr_tail = (exc2.stderr or "").strip()[-500:]
+                    reason_code = _classify_ytdlp_failure(stderr_tail)
                     attempts.append(
                         {
-                            "strategy": "cookies_from_browser",
-                            "reason_code": _classify_ytdlp_failure(stderr_tail2),
+                            "strategy": f"cookies_from_browser:{selector_name}",
+                            "reason_code": reason_code,
                         }
                     )
-                    stderr_tail = stderr_tail2
-                    reason_code = _classify_ytdlp_failure(stderr_tail2)
                 except subprocess.TimeoutExpired:
-                    return {
-                        "ok": False,
-                        "reason": "download_timeout",
-                        "reason_code": "timeout",
-                        "attempts": attempts + [{"strategy": "cookies_from_browser", "reason_code": "timeout"}],
-                    }
-            if err is not None:
-                return {
-                    "ok": False,
-                    "reason": "download_failed",
-                    "reason_code": reason_code,
-                    "stderr_tail": stderr_tail,
-                    "attempts": attempts,
-                }
+                    attempts.append(
+                        {
+                            "strategy": f"cookies_from_browser:{selector_name}",
+                            "reason_code": "timeout",
+                        }
+                    )
+                    reason_code = "timeout"
+
+        if not success:
+            return {
+                "ok": False,
+                "reason": "download_timeout" if reason_code == "timeout" else "download_failed",
+                "reason_code": reason_code,
+                "stderr_tail": stderr_tail,
+                "attempts": attempts,
+            }
 
         chosen, fail_reason = _pick_downloaded_video(
             output_dir, expected_video_id=video_id

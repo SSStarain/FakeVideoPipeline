@@ -131,6 +131,47 @@ class VisualRetrievalAgentV2:
     # ------------------------------------------------------------------
     # COT reasoning via VLM
     # ------------------------------------------------------------------
+    def _fallback_source_queries(
+        self,
+        *,
+        input_video_id: str,
+        cot_entities: dict[str, list[str]] | None = None,
+        cot_search_intent: str = "",
+        source_descriptions: list[str] | None = None,
+        prev_queries: list[str] | None = None,
+    ) -> list[str]:
+        """Build lightweight fallback queries when VLM planning fails."""
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(q: str) -> None:
+            sq = " ".join(str(q or "").replace("_", " ").split()).strip()
+            if not sq:
+                return
+            key = sq.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(sq)
+
+        entities = cot_entities or {}
+        for bucket in ("people", "events", "locations", "text_claims"):
+            for item in entities.get(bucket) or []:
+                _add(str(item))
+                if len(out) >= 4:
+                    break
+            if len(out) >= 4:
+                break
+        for desc in source_descriptions or []:
+            _add(str(desc).split(":")[-1].strip())
+            if len(out) >= 4:
+                break
+        _add(cot_search_intent)
+        _add(input_video_id)
+
+        prev = {str(q).strip().lower() for q in (prev_queries or []) if str(q).strip()}
+        return [q for q in out if q.lower() not in prev][:4]
+
     def _cot_reasoning(self, frame_paths: list[str]) -> dict[str, Any]:
         """Single VLM call: V3 content understanding + retrieval planning."""
         self._log(f"[COT] sending {len(frame_paths)} frames to VLM for chain-of-thought analysis")
@@ -242,6 +283,41 @@ class VisualRetrievalAgentV2:
             self._log(f"[Reflect] reflection: {str(data['reflection'])[:300]}")
         return (new_queries[0] if new_queries else None), (tokens or {})
 
+    def _safe_reflect_query(
+        self,
+        frame_paths: list[str],
+        prev_queries: list[str],
+        wrong_titles: list[str],
+        *,
+        input_video_id: str,
+        cot_physical_observations: str = "",
+        cot_logical_analysis: str = "",
+        cot_search_intent: str = "",
+        cot_entities: dict[str, list[str]] | None = None,
+        source_descriptions: list[str] | None = None,
+    ) -> tuple[str | None, dict[str, int]]:
+        """Reflect with a rule-based fallback when the VLM is unavailable."""
+        try:
+            return self._reflect_query(
+                frame_paths,
+                prev_queries,
+                wrong_titles,
+                cot_physical_observations=cot_physical_observations,
+                cot_logical_analysis=cot_logical_analysis,
+                cot_search_intent=cot_search_intent,
+                cot_entities=cot_entities,
+            )
+        except Exception as exc:
+            self._log(f"[Reflect] fallback due to failure: {exc}")
+            fallback_queries = self._fallback_source_queries(
+                input_video_id=input_video_id,
+                cot_entities=cot_entities,
+                cot_search_intent=cot_search_intent,
+                source_descriptions=source_descriptions,
+                prev_queries=prev_queries,
+            )
+            return (fallback_queries[0] if fallback_queries else None), {}
+
     def _looks_like_related_not_same_source(
         self,
         candidate_title: str,
@@ -285,6 +361,7 @@ class VisualRetrievalAgentV2:
     async def _deepsearch(
         self,
         *,
+        input_video_id: str,
         initial_keyword: str,
         source_descriptions: list[str],
         session: SessionState,
@@ -340,14 +417,16 @@ class VisualRetrievalAgentV2:
                 if round_trace_entry is not None:
                     round_trace_entry["search"] = {"ok": False, "reason": reason}
                 if round_num < self.max_deepsearch_rounds:
-                    current_keyword, reflect_tokens = self._reflect_query(
+                    current_keyword, reflect_tokens = self._safe_reflect_query(
                         input_frame_paths,
                         all_prev_queries,
                         wrong_titles[-8:],
+                        input_video_id=input_video_id,
                         cot_physical_observations=cot_physical_observations,
                         cot_logical_analysis=cot_logical_analysis,
                         cot_search_intent=cot_search_intent,
                         cot_entities=cot_entities,
+                        source_descriptions=source_descriptions,
                     )
                     if total_tokens is not None:
                         for k in total_tokens:
@@ -383,14 +462,16 @@ class VisualRetrievalAgentV2:
                     self._log(f"[DeepSearch] download stderr: {stderr}")
                 wrong_titles.append(cand_title)
                 if round_num < self.max_deepsearch_rounds:
-                    current_keyword, reflect_tokens = self._reflect_query(
+                    current_keyword, reflect_tokens = self._safe_reflect_query(
                         input_frame_paths,
                         all_prev_queries,
                         wrong_titles[-8:],
+                        input_video_id=input_video_id,
                         cot_physical_observations=cot_physical_observations,
                         cot_logical_analysis=cot_logical_analysis,
                         cot_search_intent=cot_search_intent,
                         cot_entities=cot_entities,
+                        source_descriptions=source_descriptions,
                     )
                     if total_tokens is not None:
                         for k in total_tokens:
@@ -453,14 +534,16 @@ class VisualRetrievalAgentV2:
             if not relevance["is_relevant"]:
                 wrong_titles.append(cand_title)
                 if round_num < self.max_deepsearch_rounds:
-                    current_keyword, reflect_tokens = self._reflect_query(
+                    current_keyword, reflect_tokens = self._safe_reflect_query(
                         input_frame_paths,
                         all_prev_queries,
                         wrong_titles[-8:],
+                        input_video_id=input_video_id,
                         cot_physical_observations=cot_physical_observations,
                         cot_logical_analysis=cot_logical_analysis,
                         cot_search_intent=cot_search_intent,
                         cot_entities=cot_entities,
+                        source_descriptions=source_descriptions,
                     )
                     if total_tokens is not None:
                         for k in total_tokens:
@@ -586,19 +669,33 @@ class VisualRetrievalAgentV2:
                 if round_trace_entry is not None:
                     round_trace_entry["next_step"] = {"ok": False, "error": str(exc)}
                 if round_num < self.max_deepsearch_rounds:
-                    current_keyword, reflect_tokens = self._reflect_query(
+                    current_keyword, reflect_tokens = self._safe_reflect_query(
                         input_frame_paths,
                         all_prev_queries,
                         wrong_titles[-8:],
+                        input_video_id=input_video_id,
                         cot_physical_observations=cot_physical_observations,
                         cot_logical_analysis=cot_logical_analysis,
                         cot_search_intent=cot_search_intent,
                         cot_entities=cot_entities,
+                        source_descriptions=source_descriptions,
                     )
                     if total_tokens is not None:
                         for k in total_tokens:
                             total_tokens[k] += reflect_tokens.get(k, 0)
                 else:
+                    if source_like_videos and not matched_urls:
+                        fallback_video = source_like_videos[-1]
+                        fallback_url = str(fallback_video.get("url") or "")
+                        if fallback_url:
+                            matched_urls.append(fallback_url)
+                            self._log("[DeepSearch] next_step failed on final round; using best-effort source-like evidence")
+                            if round_trace_entry is not None:
+                                round_trace_entry["resolved"] = {
+                                    "candidate_ref": str(fallback_video.get("ref") or ""),
+                                    "resolved_url": fallback_url,
+                                    "mode": "best_effort_after_next_step_failure",
+                                }
                     current_keyword = None
                     if round_trace_entry is not None:
                         round_trace_entry["stop_reason"] = "next_step_failed_final_round"
@@ -626,14 +723,16 @@ class VisualRetrievalAgentV2:
                     wrong_titles.append(cand_title)
                     current_keyword = next_step.get("next_keyword", "")
                     if not current_keyword and round_num < self.max_deepsearch_rounds:
-                        current_keyword, reflect_tokens = self._reflect_query(
+                        current_keyword, reflect_tokens = self._safe_reflect_query(
                             input_frame_paths,
                             all_prev_queries,
                             wrong_titles[-8:],
+                            input_video_id=input_video_id,
                             cot_physical_observations=cot_physical_observations,
                             cot_logical_analysis=cot_logical_analysis,
                             cot_search_intent=cot_search_intent,
                             cot_entities=cot_entities,
+                            source_descriptions=source_descriptions,
                         )
                         if total_tokens is not None:
                             for k in total_tokens:
@@ -673,6 +772,18 @@ class VisualRetrievalAgentV2:
                 if round_trace_entry is not None:
                     round_trace_entry["next_keyword_selected"] = current_keyword
             else:
+                if source_like_videos and not matched_urls:
+                    fallback_video = source_like_videos[-1]
+                    fallback_url = str(fallback_video.get("url") or "")
+                    if fallback_url:
+                        matched_urls.append(fallback_url)
+                        self._log("[DeepSearch] no next keyword provided; using best-effort source-like evidence")
+                        if round_trace_entry is not None:
+                            round_trace_entry["resolved"] = {
+                                "candidate_ref": str(fallback_video.get("ref") or ""),
+                                "resolved_url": fallback_url,
+                                "mode": "best_effort_no_next_keyword",
+                            }
                 self._log("[DeepSearch] no next keyword provided; stopping")
                 if round_trace_entry is not None:
                     round_trace_entry["stop_reason"] = "no_next_keyword_provided"
@@ -792,22 +903,47 @@ class VisualRetrievalAgentV2:
 
             # Step 2: COT reasoning (or skip for ablation)
             if self.use_cot:
-                cot_result = self._cot_reasoning(frame_paths)
-                session.groups[0].physical_observations = cot_result["physical_observations"]
-                if run_trace is not None:
-                    run_trace["cot"] = {
-                        "reasoning": cot_result.get("reasoning", ""),
-                        "physical_observations": cot_result.get("physical_observations", ""),
-                        "logical_analysis": cot_result.get("logical_analysis", ""),
-                        "search_intent": cot_result.get("search_intent", ""),
-                        "entities": cot_result.get("entities", {}),
-                        "estimated_sources": cot_result.get("estimated_sources", 0),
-                        "source_queries": cot_result.get("source_queries", []),
+                try:
+                    cot_result = self._cot_reasoning(frame_paths)
+                    session.groups[0].physical_observations = cot_result["physical_observations"]
+                    if run_trace is not None:
+                        run_trace["cot"] = {
+                            "reasoning": cot_result.get("reasoning", ""),
+                            "physical_observations": cot_result.get("physical_observations", ""),
+                            "logical_analysis": cot_result.get("logical_analysis", ""),
+                            "search_intent": cot_result.get("search_intent", ""),
+                            "entities": cot_result.get("entities", {}),
+                            "estimated_sources": cot_result.get("estimated_sources", 0),
+                            "source_queries": cot_result.get("source_queries", []),
+                        }
+                    cot_tokens = cot_result.get("tokens", {})
+                    for k in total_tokens:
+                        total_tokens[k] += cot_tokens.get(k, 0)
+                except Exception as exc:
+                    self._log(f"[COT] failed; falling back to filename-based retrieval: {exc}")
+                    cot_result = {
+                        "reasoning": f"COT failed; fallback used ({exc})",
+                        "physical_observations": "",
+                        "logical_analysis": "",
+                        "search_intent": "",
+                        "entities": {"people": [], "locations": [], "events": [], "text_claims": []},
+                        "estimated_sources": 1,
+                        "source_queries": [
+                            {"source_label": "source_1", "queries": [input_video_id.replace("_", " ")]}
+                        ],
+                        "tokens": {},
                     }
-                # Track COT tokens
-                cot_tokens = cot_result.get("tokens", {})
-                for k in total_tokens:
-                    total_tokens[k] += cot_tokens.get(k, 0)
+                    if run_trace is not None:
+                        run_trace["cot"] = {
+                            "reasoning": cot_result.get("reasoning", ""),
+                            "physical_observations": "",
+                            "logical_analysis": "",
+                            "search_intent": "",
+                            "entities": cot_result.get("entities", {}),
+                            "estimated_sources": cot_result.get("estimated_sources", 0),
+                            "source_queries": cot_result.get("source_queries", []),
+                            "fallback": True,
+                        }
             else:
                 # No COT: use a generic fallback keyword from the video filename
                 self._log("[COT] skipped (use_cot=False); using filename as fallback keyword")
@@ -855,6 +991,7 @@ class VisualRetrievalAgentV2:
 
             # Step 3: Unified deepsearch loop (single loop, VLM decides keyword each round)
             ds_result = asyncio.run(self._deepsearch(
+                input_video_id=input_video_id,
                 initial_keyword=initial_keyword,
                 source_descriptions=source_descriptions,
                 session=session,

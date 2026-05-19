@@ -278,7 +278,8 @@ This is NOT pixel matching. You must tolerate quality/angle/edit differences and
 THINK IN THIS ORDER (write reasoning in source_description):
 1. OVERALL ALIGNMENT: summarize what real event/activity Group B likely shows, and how it aligns with Group A's underlying footage.
 2. MANIPULATION IMPACT: explain how Group A reframes, exaggerates, fabricates context, changes causality, or invites a misleading interpretation versus Group B.
-3. DEDUPLICATE: each point must cover a unique manipulation aspect.
+3. GT-LIKE COVERAGE: include both concrete edit-level changes and at least one higher-level synthesis point that summarizes the overall misleading narrative.
+4. DEDUPLICATE: each point must cover a unique manipulation aspect.
 
 OUTPUT JSON FORMAT (strict, no extra text, NO code fences):
 {{
@@ -294,7 +295,8 @@ CONSTRAINTS:
 1. `points` should contain 3 to 5 entries when evidence supports it.
 2. No duplicate points with paraphrased wording.
 3. Ignore pure quality/viewpoint differences unless they support a narrative manipulation claim.
-4. Output VALID JSON only. No markdown fences, no commentary."""
+4. At least one point should summarize the overall story distortion created by deleting/reordering/splicing scenes, not just one local edit.
+5. Output VALID JSON only. No markdown fences, no commentary."""
 
 
 PROMPT_DEEPSEARCH_NEXT_STEP = """You are the decision-maker in a deep-search loop for video forgery analysis. You have been searching YouTube for original source videos and collecting forgery evidence.
@@ -371,16 +373,29 @@ OUTPUT JSON FORMAT:
 
 PROMPT_JUDGE_POINTS = """You are a strict but fair evaluator for video forgery analysis. You will be given a ground-truth (GT) list of 3-5 forgery points and a predicted list of 3-5 forgery points. For each GT point, decide whether any prediction matches it.
 
+Important framing:
+- GT points and predictions may be written at different abstraction levels.
+- Some items are narrative-level accusations: the edit constructs a false moral, political, social, or causal interpretation.
+- Some items are event-level findings: the edit splices, reorders, re-contextualizes, or rebinds specific scenes, audio, or actions.
+- A good prediction may express the same core misleading point either directly at the narrative level or indirectly through concrete event evidence.
+
 Scoring rules (important; follow strictly):
 1. Each GT point can be matched at most once. Use a one-to-one best assignment.
-2. A prediction counts as a match if Dimension B, the misleading point / false reframing, is roughly consistent with the GT point.
-   - Dimension B: the misleading point or false narrative created by the edit.
-   - Dimension A: the manipulation method. This is secondary and does not need to match for `verdict=1`, but you must still report `matched_dim_method` truthfully.
-   - If Dimension B is roughly consistent, mark `verdict=1`.
-   - If Dimension B is not consistent, mark `verdict=0`, but still provide the closest GT index and explain why.
-3. "Roughly consistent" allows paraphrase, synonymy, wording differences, and different abstraction levels.
-4. Every GT point should receive the best available predicted match. If multiple GT points compete for the same prediction, choose the assignment that gives the best overall scoring.
-5. Output strict JSON only. Do not use markdown fences.
+2. Evaluate every GT/pred pair on two dimensions:
+   - Dimension A: manipulation method. Examples: splicing unrelated clips, reordering scenes, removing narration, binding unrelated audio, selective omission, context switching.
+   - Dimension B: misleading point / false reframing. Examples: portraying someone as rule-breaking, constructing a negative personality arc, implying opportunistic recruitment, or creating a moral-judgment framing.
+3. Dimension B is primary, but judge it flexibly across abstraction levels:
+   - Direct narrative match: If the prediction states substantially the same false reframing or accusation as the GT, mark `matched_dim_misleading=true` and `verdict=1`.
+   - Event-to-narrative support: If the GT is narrative-level, and the prediction identifies the concrete edited event(s) that materially support that same narrative reframing, you may still mark `matched_dim_misleading=true` and `verdict=1` even if the prediction is more concrete and less interpretive.
+   - Method-only overlap is not enough: If the prediction only says clips were spliced/reordered/altered, or only points out temporal/geographic inconsistency, but does not reach the same misleading implication as the GT and does not clearly support it, mark `verdict=0`.
+4. "Roughly consistent" allows paraphrase, synonymy, wording differences, partial compression of multiple scenes into one point, and different abstraction levels, as long as the core misleading implication is aligned.
+5. Be conservative about over-crediting:
+   - Do not give credit just because both items mention the same event.
+   - Do not give credit just because both items describe editing manipulation in general.
+   - Do give credit when the prediction captures the same accusation, reframing, or a concrete event-level mechanism that clearly underpins that accusation.
+6. Report `matched_dim_method` truthfully even when `verdict=1` is driven mainly by Dimension B.
+7. Every GT point should receive the best available predicted match. If multiple GT points compete for the same prediction, choose the assignment that gives the best overall scoring.
+8. Output strict JSON only. Do not use markdown fences.
 
 GT (3-5 points):
 {gt_block}
